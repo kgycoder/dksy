@@ -639,6 +639,16 @@ public class MainActivity extends AppCompatActivity {
        응답은 searchResult 타입(같은 id)으로 돌려보내 JS 브릿지(__sync/callCs)를 그대로 쓴다.
        구조 파싱은 경로 고정 대신 렌더러 키를 재귀 탐색해 응답 구조 변경에 강하게 만들었다. */
     private static final String YTM_VER = "1.20241127.01.00";
+    /** 1차 시도가 400/네트워크 오류로 실패하면 최근 날짜 기반 버전으로 재시도한다(오래된 clientVersion 거부 대비). 성공하면 이후 호출은 새 버전을 우선 사용. */
+    private volatile boolean ytmFresh = false;
+    private static String ytmVerFresh() {
+        java.util.Calendar c = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"));
+        c.add(java.util.Calendar.DAY_OF_YEAR, -10);
+        return String.format(java.util.Locale.US, "1.%04d%02d%02d.01.00",
+                c.get(java.util.Calendar.YEAR), c.get(java.util.Calendar.MONTH) + 1,
+                c.get(java.util.Calendar.DAY_OF_MONTH));
+    }
+    private static final Pattern YTM_NORM = Pattern.compile("[^\\p{L}\\p{N}]+");
     private static final Pattern YTM_DUR = Pattern.compile("^\\d{1,2}:\\d{2}(:\\d{2})?$");
     private static final Pattern YTM_YEAR = Pattern.compile("^(19|20)\\d{2}$");
     private static final Pattern YTM_TYPE = Pattern.compile(
@@ -649,14 +659,21 @@ public class MainActivity extends AppCompatActivity {
 
     /** 일시적인 400/5xx/네트워크 오류는 한 번 재시도 */
     private String ytmCall(String ep, JSONObject body) throws Exception {
-        try { return ytmCallOnce(ep, body); }
-        catch (IOException e) { Thread.sleep(300); return ytmCallOnce(ep, body); }
+        boolean first = ytmFresh;
+        try { return ytmCallOnce(ep, body, first); }
+        catch (IOException e) {
+            Thread.sleep(250);
+            String r = ytmCallOnce(ep, body, !first);   // 두 번째는 반대 버전으로
+            ytmFresh = !first;
+            return r;
+        }
     }
 
-    private String ytmCallOnce(String ep, JSONObject body) throws Exception {
+    private String ytmCallOnce(String ep, JSONObject body, boolean fresh) throws Exception {
+        final String ver = fresh ? ytmVerFresh() : YTM_VER;
         JSONObject client = new JSONObject();
         client.put("clientName", "WEB_REMIX");
-        client.put("clientVersion", YTM_VER);
+        client.put("clientVersion", ver);
         client.put("hl", "ko");
         client.put("gl", "KR");
         body.put("context", new JSONObject().put("client", client));
@@ -665,7 +682,7 @@ public class MainActivity extends AppCompatActivity {
                 .post(RequestBody.create(body.toString(),
                         MediaType.parse("application/json; charset=utf-8")))
                 .addHeader("X-YouTube-Client-Name", "67")
-                .addHeader("X-YouTube-Client-Version", YTM_VER)
+                .addHeader("X-YouTube-Client-Version", ver)
                 .addHeader("Origin", "https://music.youtube.com")
                 .addHeader("Referer", "https://music.youtube.com/")
                 .addHeader("Accept-Language", "ko-KR,ko;q=0.9,en;q=0.8")
@@ -793,6 +810,7 @@ public class MainActivity extends AppCompatActivity {
         t.put("artistId", m.optString("artistId"));
         t.put("year", m.optString("year"));
         t.put("kind", "song");
+        if (!m.optString("vt").isEmpty()) t.put("vt", m.optString("vt"));   // musicVideoType (검색 필터용, doMusicSearch 에서 제거)
         return t;
     }
 
@@ -847,6 +865,7 @@ public class MainActivity extends AppCompatActivity {
         String kind = ytmKindOf(bid);
         String vid = kind.isEmpty() ? ytmStr(r, "videoId") : "";
         JSONObject m = ytmMeta(runs);
+        if (!vid.isEmpty()) m.put("vt", ytmStr(r, "musicVideoType"));
         String art = ytmThumb(r);
         if (!vid.isEmpty()) return ytmTrack(vid, name, m, art);
         if (!kind.isEmpty()) return ytmEntity(kind, bid, name, m, art);
@@ -901,11 +920,24 @@ public class MainActivity extends AppCompatActivity {
             JSONObject doc = new JSONObject(ytmCall("search", body));
             JSONArray out = new JSONArray();
             java.util.HashSet<String> seen = new java.util.HashSet<>();
+            java.util.HashSet<String> seenKey = new java.util.HashSet<>();
+            final boolean song = kind.equals("song");
             for (Object o : ytmFind(doc, "musicResponsiveListItemRenderer")) {
                 if (!(o instanceof JSONObject)) continue;
                 JSONObject it = ytmList((JSONObject) o);
                 if (it == null || !it.optString("kind").equals(kind)) continue;
                 if (!seen.add(it.optString("id"))) continue;
+                if (song) {
+                    /* 앨범/싱글/EP 에 실제로 등록된 곡(ATV)만 남긴다. 뮤직비디오·UGC 영상은 제외.
+                       (유형 정보가 없거나 앨범이 연결돼 있으면 안전하게 통과) */
+                    String vt = it.optString("vt");
+                    it.remove("vt");
+                    if (!vt.isEmpty() && !vt.equals("MUSIC_VIDEO_TYPE_ATV") && it.optString("albumId").isEmpty()) continue;
+                    /* 같은 곡이 싱글/정규/리패키지 앨범마다 중복 노출되는 것을 제거(순위가 높은 첫 항목 유지) */
+                    String first = it.optString("channel").split(",")[0];
+                    String key = YTM_NORM.matcher((it.optString("title") + "|" + first).toLowerCase(java.util.Locale.ROOT)).replaceAll("");
+                    if (!seenKey.add(key)) continue;
+                }
                 out.put(it);
                 if (out.length() >= 20) break;
             }
@@ -923,8 +955,24 @@ public class MainActivity extends AppCompatActivity {
             String country = msg.optString("country", "");
             if (!country.isEmpty())
                 body.put("formData", new JSONObject().put("selectedValues", new JSONArray().put(country)));
-            JSONObject doc = new JSONObject(ytmCall("browse", body));
+            /* 앨범(MPREb_)은 공식 웹 클라이언트처럼 pageType 설정을 함께 보낸다. 실패하면(400 등) 설정 없이 한 번 더 시도. */
+            final String bid0 = msg.optString("browseId");
+            final boolean isAlbumId = bid0.startsWith("MPREb_");
+            if (isAlbumId) {
+                body.put("browseEndpointContextSupportedConfigs", new JSONObject().put(
+                        "browseEndpointContextMusicConfig",
+                        new JSONObject().put("pageType", "MUSIC_PAGE_TYPE_ALBUM")));
+            }
+            String raw;
+            try { raw = ytmCall("browse", body); }
+            catch (IOException e) {
+                if (!isAlbumId) throw e;
+                body.remove("browseEndpointContextSupportedConfigs");
+                raw = ytmCall("browse", body);
+            }
+            JSONObject doc = new JSONObject(raw);
             JSONObject res = new JSONObject();
+            res.put("bid", bid0);   // ※ "id" 는 ytmSend 가 요청 id 로 덮어쓰므로 별도 키 사용
             String name = "", thumb = "", desc = "";
             JSONObject hm = new JSONObject();
             String[] hk = {"musicImmersiveHeaderRenderer", "musicVisualHeaderRenderer",
