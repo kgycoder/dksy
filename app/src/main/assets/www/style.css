@@ -5594,3 +5594,8 @@ html.glass-native .c-dur {
 .mi-pop-box { width: 100%; max-width: 420px; max-height: 72vh; display: flex; flex-direction: column; gap: 12px; padding: 18px; border-radius: 18px; background: #1c1c1e; box-shadow: 0 20px 60px rgba(0,0,0,.6); }
 .mi-pop-h { font-size: 17px; font-weight: 700; overflow-wrap: anywhere; }
 .mi-pop-body { flex: 1; min-height: 0; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.65; color: rgba(255,255,255,.82); -webkit-overflow-scrolling: touch; }
+
+/* ── 성능: 백그라운드(화면 꺼짐/홈)에서는 무한 반복 CSS 애니메이션도 멈춰 컴포지터 프레임 생성을 막는다 ── */
+html.bg-mode .vb,
+html.bg-mode .c-now-bar span,
+html.bg-mode .spinner { animation-play-state: paused !important; }
