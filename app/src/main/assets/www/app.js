@@ -72,19 +72,27 @@ function _npIsOpen() {
     if (!_npElRef) _npElRef = document.getElementById('np');
     return !!(_npElRef && _npElRef.classList.contains('on'));
 }
+/* 매 vsync(60Hz)마다 rAF 콜백을 깨우면, 그리지 않는 프레임에서도 WebView 가 프레임 파이프라인(스타일/레이아웃/합성)을
+   계속 돌려 CPU·GPU 발열이 쌓인다. 실제로 그리는 주기(재생 50ms / 일시정지 125ms)로만 타이머를 깨우고,
+   경과 시간(steps = 16.7ms 단위)만큼 상태를 한 번에 진행시켜 움직이는 속도는 이전과 완전히 같게 유지한다. */
+let _bgLastT = 0;
 function bgLoop() {
-    if (window.__bgMode) { _bgRafId = null; return; }   // 백그라운드: 프레임 루프 중단
-    _bgRafId = requestAnimationFrame(bgLoop);
-    BG.f++;
-    BG.h += (BG.th - BG.h) * .005;
-    BG.e += (BG.te - BG.e) * .014;
-    BG.energyLevel += (BG.tEnergyLevel - BG.energyLevel) * .03;
-    if (BG.beat > 0) BG.beat = Math.max(0, BG.beat - BG.beatDecay * (1 + BG.energyLevel));
+    if (window.__bgMode) { _bgRafId = null; return; }   // 백그라운드: 루프 중단
+    _bgRafId = setTimeout(bgLoop, BG.playing ? 50 : 125);
+    if (document.hidden) { _bgLastT = 0; return; }
+    const now = performance.now();
+    const steps = _bgLastT ? Math.min(8, Math.max(1, (now - _bgLastT) / 16.667)) : 3;
+    _bgLastT = now;
+    const kk = c => 1 - Math.pow(1 - c, steps);
+    BG.f += steps;
+    BG.h += (BG.th - BG.h) * kk(.005);
+    BG.e += (BG.te - BG.e) * kk(.014);
+    BG.energyLevel += (BG.tEnergyLevel - BG.energyLevel) * kk(.03);
+    if (BG.beat > 0) BG.beat = Math.max(0, BG.beat - BG.beatDecay * (1 + BG.energyLevel) * steps);
 
     const beat = BG.beat, en = BG.energyLevel;
 
-    // 상태/오브 이동은 매 프레임 그대로 진행 → 움직이는 속도·박자 반응은 이전과 동일
-    const speed = 1 + BG.e * 1.4 + beat * (1.5 + en * 3.5);
+    const speed = (1 + BG.e * 1.4 + beat * (1.5 + en * 3.5)) * steps;
     BG.orbs.forEach(o => {
         o.x += o.vx * speed; o.y += o.vy * speed;
         if (o.x < -o.r) o.x = BG_W + o.r; if (o.x > BG_W + o.r) o.x = -o.r;
@@ -94,8 +102,7 @@ function bgLoop() {
     // 실제 그리기는 3프레임에 1번(20fps, 일시정지 시 ~7fps). 매 프레임 전체 화면을 다시 그리면 WebView 합성과
     // 네이티브 글래스(배경 캡처·블러)까지 60fps 로 다시 계산되어 시간이 지날수록 부하/발열이 커진다.
     // 일시정지 중에는 오브 이동이 프레임당 1px 미만이고 위에 blur(120px) 오버레이가 덮여 있어 10fps 로도 구분이 안 된다.
-    if (BG.f % (BG.playing ? 3 : 8)) return;
-    if (performance.now() - window.__lastScrollAt < 160) return;   // 스크롤 중엔 그리기 생략
+    if (now - window.__lastScrollAt < 160) return;   // 스크롤 중엔 그리기 생략
     // 전체화면 플레이어(#np, 불투명)가 덮고 있는 동안엔 보이지 않으므로 그리지 않는다.
     if (_npIsOpen()) return;
 
@@ -493,6 +500,9 @@ function _applyMoodToMesh() {
 function _lerpMeshColors() {
     const target = NP_MESH.targetColors;
     if (!target) return;
+    /* 색이 목표에 수렴했으면(목표 배열이 같고) 더 계산하지 않는다 — NP 가 닫혀 있는 동안 50ms 마다 반복되던 낭비 제거 */
+    if (NP_MESH._tc === target && NP_MESH._settled) return;
+    let moving = false;
     NP_MESH.colors.forEach((c, i) => {
         const t = target[i] || target[i % target.length];
         let dh = t.h - c.h;
@@ -508,7 +518,9 @@ function _lerpMeshColors() {
         c.h = (c.h + dh * spd + 360) % 360;
         c.s += ds * spd;
         c.l += dl * spd;
+        if (Math.abs(dh) > .04 || Math.abs(ds) > .04 || Math.abs(dl) > .04) moving = true;
     });
+    NP_MESH._tc = target; NP_MESH._settled = !moving;
 }
 
 function renderNpMesh(beat, en, steps) {
@@ -1450,6 +1462,21 @@ function _renderSearch(d) {
         area.appendChild(g);
     }
 }
+/* YTM 순위를 기본으로 두고, 제목/아티스트가 검색어와 확실히 일치하는 곡만 앞으로 끌어올린다(안정 정렬). */
+function _rankSongs(q, songs) {
+    const nq = _nrm(q);
+    if (!nq || songs.length < 2) return songs;
+    const sc = t => {
+        const ti = _nrm(t.title), ar = _nrm(t.channel), both = ti + ar;
+        if (ti === nq) return 4;
+        if (ar + ti === nq || ti + ar === nq) return 4;
+        if (ti.startsWith(nq)) return 3;
+        if (nq.length >= 2 && ti.includes(nq)) return 2;
+        if (nq.length >= 2 && both.includes(nq)) return 1;
+        return 0;
+    };
+    return songs.map((t, i) => ({ t, i, s: sc(t) })).sort((a, b) => b.s - a.s || a.i - b.i).map(x => x.t);
+}
 async function doSearch(query) {
     if (!query?.trim()) return;
     gv('search', document.querySelector('[data-v="search"]'));
@@ -1461,20 +1488,23 @@ async function doSearch(query) {
     const area = document.getElementById('s-res');
     area.innerHTML = `<div class="state"><div class="spinner"></div><p style="margin-top:12px">검색 중...</p></div>`;
     _sStack.length = 0; _sRender = null; _miMode(false);
-    /* 영상 검색(기존 그대로: 쿼리에 키워드를 덧붙이지 않음)과 곡/아티스트/앨범 검색을 동시에 요청 */
+    /* 앨범/싱글/EP 에 실제 등록된 곡(YouTube Music 카탈로그)·아티스트·앨범만 검색한다. 세 요청은 동시에 보낸다.
+       일반 영상 검색은 카탈로그 결과가 전혀 없을 때(YTM 장애 등)만 폴백으로 사용 → 요청·DOM 모두 감소 */
     const mq = kind => cachedCall({ type: 'musicSearch', kind, query: q }, 300000);
-    const [vr, sr, ar, br] = await Promise.allSettled([
-        cachedCall({ type: 'search', query: q }, 300000), mq('song'), mq('artist'), mq('album')]);
-    const songs = sr.status === 'fulfilled' ? (sr.value.items || []) : [];
-    const sid = new Set(songs.map(t => t.id));
+    const [sr, ar, br] = await Promise.allSettled([mq('song'), mq('artist'), mq('album')]);
     const d = {
-        songs,
+        songs: sr.status === 'fulfilled' ? _rankSongs(q, sr.value.items || []) : [],
         artists: ar.status === 'fulfilled' ? (ar.value.items || []) : [],
         albums: br.status === 'fulfilled' ? (br.value.items || []) : [],
-        videos: vr.status === 'fulfilled' ? sortMusicFirst(vr.value.tracks || []).filter(t => !sid.has(t.id)) : []
+        videos: []
     };
+    let vr = null;
+    if (!d.songs.length && !d.artists.length && !d.albums.length) {
+        vr = await Promise.allSettled([cachedCall({ type: 'search', query: q }, 300000)]).then(a => a[0]);
+        if (vr.status === 'fulfilled') d.videos = sortMusicFirst(vr.value.tracks || []);
+    }
     if (!d.songs.length && !d.artists.length && !d.albums.length && !d.videos.length) {
-        const err = vr.status === 'rejected' ? vr.reason?.message : '';
+        const err = vr && vr.status === 'rejected' ? vr.reason?.message : (sr.status === 'rejected' ? sr.reason?.message : '');
         area.innerHTML = err ? `<div class="state"><h3>검색 실패</h3><p>${esc(err)}</p></div>`
             : `<div class="state"><h3>결과 없음</h3><p>다른 검색어를 시도해보세요</p></div>`;
         return;
@@ -1484,12 +1514,16 @@ async function doSearch(query) {
 }
 
 /* ── 아티스트 / 앨범 상세 ── */
+const _nrm = s => String(s || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
 async function _miFallback(kind, id, hint) {
     if (!hint?.name) return null;
     const q = [hint.name, kind === 'album' ? hint.artist : ''].filter(Boolean).join(' ');
     const r = await cachedCall({ type: 'musicSearch', kind, query: q }, 300000);
-    const nm = hint.name.trim().toLowerCase();
-    const it = (r.items || []).find(x => x.id !== id && (x.name || '').trim().toLowerCase() === nm);
+    const nm = _nrm(hint.name), ar = _nrm(hint.artist);
+    const items = (r.items || []).filter(x => x.id !== id);
+    const it = items.find(x => _nrm(x.name) === nm && (!ar || !x.artist || _nrm(x.artist).includes(ar.slice(0, 6)) || ar.includes(_nrm(x.artist).slice(0, 6))))
+        || items.find(x => _nrm(x.name) === nm)
+        || items.find(x => { const n = _nrm(x.name); return n && nm && (n.includes(nm) || nm.includes(n)); });
     return it ? cachedCall({ type: 'musicBrowse', browseId: it.id }) : null;
 }
 async function miOpen(kind, id, hint) {
@@ -1502,7 +1536,10 @@ async function miOpen(kind, id, hint) {
     area.innerHTML = _spin;
     try {
         let d;
-        try { d = await cachedCall({ type: 'musicBrowse', browseId: id }); }
+        try {
+            if (kind === 'album' && !_isAlbumId(id)) throw new Error('앨범 정보를 찾을 수 없어요');
+            d = await cachedCall({ type: 'musicBrowse', browseId: id });
+        }
         catch (e) { d = await _miFallback(kind, id, hint).catch(() => null); if (!d) throw e; }
         _sRender = () => _renderMiPage(kind, d);
         _sRender();
@@ -1558,7 +1595,7 @@ function _renderMiPage(kind, d) {
         const songs = sec.items.filter(x => x.kind === 'song'), ents = sec.items.filter(x => x.kind !== 'song');
         if (songs.length) {
             songs.forEach(t => {   // 상세 페이지의 곡에 앨범/아티스트 정보를 채워 넣는다
-                if (isAl) { t.art = t.art || d.thumb; t.album = t.album || d.name; t.albumId = t.albumId || d.id; t.year = t.year || d.year; }
+                if (isAl) { t.art = t.art || d.thumb; t.album = t.album || d.name; t.albumId = t.albumId || d.bid || ''; t.year = t.year || d.year; }
                 t.channel = t.channel || (isAl ? d.artist : d.name);
                 t.artistId = t.artistId || (isAl ? d.artistId : '');
             });
@@ -1575,11 +1612,12 @@ function _renderMiPage(kind, d) {
 }
 
 /* ── 재생 중 곡 정보(아티스트/앨범) + 연관곡 자동 이어붙이기 ── */
+const _isAlbumId = s => typeof s === 'string' && /^MPREb_[\w-]+$/.test(s);
 function miSetNpMeta(t) {
     const ch = document.getElementById('np-ch'), al = document.getElementById('np-album');
     if (ch) { ch.classList.toggle('mi-lnk', !!t.artistId); ch.onclick = t.artistId ? () => miOpen('artist', t.artistId, { name: t.channel }) : null; }
     if (al) {
-        const on = !!(t.album && t.albumId);
+        const on = !!(t.album && _isAlbumId(t.albumId));   // 잘못 저장된 id(예: 요청 번호)로는 이동하지 않는다
         al.textContent = on ? t.album + (t.year ? ' · ' + t.year : '') : '';
         al.onclick = on ? () => miOpen('album', t.albumId, { name: t.album, artist: t.channel }) : null;
         al.style.display = on ? '' : 'none';
@@ -1594,7 +1632,8 @@ async function miTrackContext(t) {
     const me = items.find(x => x.id === t.id);
     if (me) {
         let ch = false;
-        for (const k of ['album', 'albumId', 'artistId', 'year', 'art']) if (!t[k] && me[k]) { t[k] = me[k]; ch = true; }
+        for (const k of ['album', 'albumId', 'artistId', 'year', 'art'])
+            if ((!t[k] || (k === 'albumId' && !_isAlbumId(t[k]))) && me[k]) { t[k] = me[k]; ch = true; }
         if (ch) miSetNpMeta(t);
     }
     /* 재생목록 끝이 가까우면 이 곡의 라디오를 이어붙여 끊김 없이 재생 (반복/셔플 사용 중이면 건드리지 않음) */
@@ -4394,7 +4433,7 @@ async function _translateLyricsIfNeeded() {
             const text = obj.text;
             let tr = _trCache.get(text);
             if (tr === undefined) {
-                try { tr = await _translateText(text); _trCache.set(text, tr); }
+                try { tr = await _translateText(text); if (_trCache.size >= 300) _trCache.delete(_trCache.keys().next().value); _trCache.set(text, tr); }
                 catch { tr = null; }
             }
             if (LY.videoId !== videoId) return;
